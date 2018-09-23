@@ -1,0 +1,24 @@
+resolver: nightly-2018-06-21
+
+packages:
+- planning
+
+# should match hakaru.nix
+- location:
+    git: git@github.com:hakaru-dev/hakaru.git
+    commit: 17e615514a6e0bb242139c4f42c4a2d3a619bd47
+  extra-dep: true
+
+# h3 not currently on hackage
+- location:
+    git: git@github.com:j-mueller/h3.git
+    commit: fe0b4936032b8c1c9080e29d10426a93fc1d4739
+    subdirs:
+    - src/h3-core
+    - src/h3-colour
+    - src/h3-concur-react
+  extra-dep: true
+
+flags: {}
+
+extra-package-dbs: []

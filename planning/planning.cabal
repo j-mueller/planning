@@ -25,7 +25,10 @@ executable planning
     base,
     containers -any,
     hakaru -any,
+    lens -any,
     mtl -any,
     mwc-random -any,
     text -any,
-    transformers -any
+    transformers -any,
+    pretty -any,
+    vector -any

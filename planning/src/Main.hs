@@ -17,6 +17,7 @@ import           Control.Lens                                   hiding
 import           Control.Monad                                  (foldM)
 import           Control.Monad.State
 import           Data.Bifunctor                                 (Bifunctor (..))
+import           Data.List.NonEmpty                             (NonEmpty (..))
 import           Data.Map.Strict                                (Map)
 import qualified Data.Map.Strict                                as Map
 import           Data.Maybe                                     (catMaybes,
@@ -36,11 +37,11 @@ import           Language.Hakaru.Sample                         (runEvaluate)
 import           Language.Hakaru.Syntax.ABT
 import           Language.Hakaru.Syntax.AST                     (Term)
 import           Language.Hakaru.Syntax.CSE                     (cse)
+import           Language.Hakaru.Syntax.IClasses                (Foldable11 (..))
 import qualified Language.Hakaru.Syntax.Prelude                 as Hakaru
 import           Language.Hakaru.Syntax.Uniquify                (uniquify)
 import           Language.Hakaru.Syntax.Value                   (Value (..))
 import           Language.Hakaru.Types.DataKind
-import Language.Hakaru.Syntax.IClasses (Foldable11(..))
 
 import qualified Data.Vector                                    as Vector
 import           Text.PrettyPrint                               (Doc, render)
@@ -138,18 +139,21 @@ ana p = go
     go = Fix . fmap go . p
 
 -- | A task with a duration
-data TaskF d c = TaskF {
+data TaskF h d c = TaskF {
     taskName     :: !Text,
     taskDuration :: !d,
-    taskDepends  :: [c] -- ^ Dependencies. Dependencies may run in parallel but they all have to be completed before this task can start.
+    taskDepends  :: h c -- ^ Dependencies
     }
-    deriving Functor
+    
+instance Functor h => Functor (TaskF h d) where
+    fmap f (TaskF n d dd) = TaskF n d (fmap f dd)
 
 class HasTaskF t where
+    type ChildTp  t :: * -> *
     type Duration t :: *
     type Children t :: *
 
-    taskF :: Lens' t (TaskF (Duration t) (Children t))
+    taskF :: Lens' t (TaskF (ChildTp t) (Duration t) (Children t))
 
     name :: Lens' t Text
     name = taskF . lens g s where
@@ -161,21 +165,22 @@ class HasTaskF t where
         g = taskDuration
         s tf d = tf { taskDuration = d }
 
-    children :: Lens' t [Children t]
+    children :: Lens' t (ChildTp t (Children t))
     children = taskF . lens g s where
         g = taskDepends
         s tf d = tf { taskDepends = d }
 
-instance HasTaskF (TaskF d c) where
-    type Duration (TaskF d c) = d
-    type Children (TaskF d c) = c
+instance HasTaskF (TaskF h d c) where
+    type ChildTp  (TaskF h d c) = h
+    type Duration (TaskF h d c) = d
+    type Children (TaskF h d c) = c
 
     taskF = id
 
-instance Bifunctor TaskF where
+instance Functor h => Bifunctor (TaskF h) where
     bimap f g (TaskF n d dd) = TaskF n (f d) (g <$> dd)
 
-newtype Task d = Task { getTask :: Fix (TaskF d) }
+newtype Task d = Task { getTask :: Fix (TaskF [] d) }
 
 instance Functor Task where
     fmap f (Task t) = Task (hmap (first f) t)
@@ -268,7 +273,7 @@ data TaskMeta = TaskMeta {
 
 data PlannerState a = PlannerState {
     plannerStateDurations    :: Map TaskId a, -- ^ The duration of each task
-    plannerStateDependencies :: Map TaskId [TaskId], -- ^ Dependencies of a task
+    plannerStateDependencies :: Map TaskId (Dependency TaskId), -- ^ Dependencies of a task
     plannerStateMetaData     :: Map TaskId TaskMeta,
     plannerStateIDs          :: [TaskId] -- ^ Supply of task IDs
     } deriving Functor
@@ -278,7 +283,7 @@ durations = lens g s where
     g = plannerStateDurations
     s ps d = ps { plannerStateDurations = d }
 
-dependencies :: Lens' (PlannerState a) (Map TaskId [TaskId])
+dependencies :: Lens' (PlannerState a) (Map TaskId (Dependency TaskId))
 dependencies = lens g s where
     g = plannerStateDependencies
     s ps d = ps { plannerStateDependencies = d }
@@ -292,25 +297,32 @@ initialPlannerState = PlannerState d dd md i where
 
 type PlannerMonad = State (PlannerState Distribution)
 
-newtype Task' = Task' { getTask' :: TaskF Distribution TaskId }
+newtype Task' = Task' { getTask' :: TaskF Dependency Distribution TaskId }
 
 instance HasTaskF Task' where
+    type ChildTp Task'  = Dependency
     type Duration Task' = Distribution
     type Children Task' = TaskId
 
     taskF = lens getTask' (const Task')
 
+data Dependency a =
+    AllOf [Dependency a]
+    | AnyOf [Dependency a]
+    | Dep a
+    deriving Functor
+
 -- | Create a [[Task']] with a list of subtasks
-mkTask' :: Text -> Distribution -> [TaskId] -> Task'
+mkTask' :: Text -> Distribution -> Dependency TaskId -> Task'
 mkTask' t d = Task' . TaskF t d
 
 -- | Create a [[Task']] whose duration is given by a distribution
 task' :: Text -> Distribution -> Task'
-task' t dist = mkTask' t dist []
+task' t dist = mkTask' t dist (AllOf [])
 
 -- | Create a group of [[Task']]s that can run in parallel
 taskGroup' :: Text -> [TaskId] -> Task'
-taskGroup' t = mkTask' t (constantDuration 0)
+taskGroup' t = mkTask' t (constantDuration 0) . AnyOf . fmap Dep
 
 -- | Get a fresh ID
 nextID :: MonadState (PlannerState a) m => m TaskId
@@ -350,11 +362,18 @@ modelDist PlannerState{ plannerStateDurations = du , plannerStateDependencies = 
     -- based on its dependencies
     -- TODO: Dynamic programming to avoid recursion!
     lkp :: abt '[] (HArray HReal) -> TaskId -> abt '[] HReal
-    lkp arr i = case fromMaybe [] $ Map.lookup i de of
-                    [] -> Hakaru.zero -- no dependencies; can start immediately
-                    xs ->   let x':xs' = inner <$> xs
-                                inner t = lkp arr t Hakaru.+ arr Hakaru.! Hakaru.nat_ (fromIntegral $ getTaskId t)
-                            in foldl Hakaru.min x' xs'
+    lkp arr i = 
+        let ll a = arr Hakaru.! Hakaru.nat_ (fromIntegral $ getTaskId a)
+            go r = case r of
+                        Dep a    -> lkp arr a Hakaru.+ ll a
+                        AnyOf [] -> Hakaru.zero -- no dependencies; can start immediately
+                        AnyOf xs -> let x':xs' = go <$> xs
+                                    in foldl Hakaru.min x' xs'
+                        AllOf [] -> Hakaru.zero -- no dependencies; can start immediately
+                        AllOf xs -> let x':xs' = go <$> xs
+                                    in foldl Hakaru.max x' xs'
+        in maybe Hakaru.zero go $ Map.lookup i de
+                    
 
     -- Generate a measure of the durations of all tasks from the input distributions
     ms :: abt '[] (HMeasure (HArray HReal))
@@ -390,11 +409,11 @@ prettyDist = p . opt . modelDist where
 -- | Example project
 myProject2 :: PlannerState Distribution
 myProject2 = snd $ flip runState initialPlannerState $ do
-    p1 <- addTask' $ task' "a" (approxIntvl 10 20)
-    p2 <- addTask' $ task' "b" (approxIntvl 10 20)
-    -- c and d start at the same time
-    _  <- addTask' $ mkTask' "c" (approxIntvl 5 8) [p1, p2]
-    _  <- addTask' $ mkTask' "d" (approxIntvl 10 12) [p1, p2]
+    a <- addTask' $ task' "a" (approxIntvl 10 20)
+    b <- addTask' $ task' "b" (approxIntvl 10 20)
+    -- c and d start at the same time, when a or b are finished
+    c  <- addTask' $ mkTask' "c" (approxIntvl 5 8) (AnyOf [Dep a, Dep b])
+    d  <- addTask' $ mkTask' "d" (approxIntvl 10 12) (AnyOf [Dep a, Dep b])
     -- e starts when c and d are finished
-    -- TODO
+    _ <- addTask' $ mkTask' "e" (approxIntvl 2 3) (AllOf [Dep c, Dep d])
     return ()
